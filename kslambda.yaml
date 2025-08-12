@@ -1,0 +1,742 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Document Conversion Lambda Stack - Lambda Function, Layer, and S3 Notifications (Stack 2 of 2)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: knowledge-converter
+    Description: Project name (must match infrastructure stack)
+    
+  Environment:
+    Type: String
+    Default: poc
+    AllowedValues: 
+      - poc
+      - dev
+      - staging
+      - prod
+    Description: Environment name (must match infrastructure stack)
+    
+  # ================================
+  # Lambda Configuration
+  # ================================
+  LambdaMemorySize:
+    Type: Number
+    Default: 1536
+    MinValue: 512
+    MaxValue: 10240
+    Description: Lambda memory size in MB (affects CPU allocation)
+    
+  LambdaTimeout:
+    Type: Number
+    Default: 600
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda timeout in seconds (max 15 minutes)
+    
+  LambdaArchitecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+    Description: Lambda processor architecture
+    
+  # ================================
+  # Layer Configuration
+  # ================================
+  LayerDeploymentMethod:
+    Type: String
+    Default: inline
+    AllowedValues: [inline, s3]
+    Description: How to deploy the layer (inline for testing, s3 for production)
+    
+  LayerS3Bucket:
+    Type: String
+    Default: ""
+    Description: S3 bucket containing layer zip file (only needed if LayerDeploymentMethod=s3)
+    
+  LayerS3Key:
+    Type: String
+    Default: "layers/document-processing-layer.zip"
+    Description: S3 key for layer zip file (only needed if LayerDeploymentMethod=s3)
+    
+  # ================================
+  # Processing Configuration
+  # ================================
+  MaxFileSizeMB:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 500
+    Description: Maximum file size to process in MB
+    
+  EnableImageProcessing:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable image processing in PDFs (increases memory usage)
+    
+  # ================================
+  # Deployment Configuration
+  # ================================
+  DeploymentPackageMethod:
+    Type: String
+    Default: inline
+    AllowedValues: [inline, s3]
+    Description: How to deploy Lambda code (inline for development, s3 for production)
+    
+  CodeS3Bucket:
+    Type: String
+    Default: ""
+    Description: S3 bucket containing Lambda code zip (only needed if DeploymentPackageMethod=s3)
+    
+  CodeS3Key:
+    Type: String
+    Default: "lambda/document-converter.zip"
+    Description: S3 key for Lambda code zip (only needed if DeploymentPackageMethod=s3)
+
+Conditions:
+  UseInlineLayer: !Equals [!Ref LayerDeploymentMethod, "inline"]
+  UseS3Layer: !Equals [!Ref LayerDeploymentMethod, "s3"]
+  UseInlineCode: !Equals [!Ref DeploymentPackageMethod, "inline"]
+  UseS3Code: !Equals [!Ref DeploymentPackageMethod, "s3"]
+  HasMonitoring: 
+    Fn::ImportValue: !Sub "${ProjectName}-enable-monitoring"
+  HasNotificationTopic: !Not [!Equals [!ImportValue 
+    !Sub "${ProjectName}-failure-topic-arn", ""]]
+
+Resources:
+
+  # ================================
+  # Lambda Layer (Inline for Development)
+  # ================================
+  DocumentProcessingLayerInline:
+    Type: AWS::Lambda::LayerVersion
+    Condition: UseInlineLayer
+    Properties:
+      LayerName: !Sub "${ProjectName}-document-processing-inline"
+      Description: "Document processing libraries: pdfplumber, python-docx, pandas (inline deployment)"
+      Content:
+        ZipFile: |
+          # This is a placeholder for inline deployment
+          # In production, you should use S3 deployment with pre-built layer
+          import sys
+          print("Layer placeholder - use S3 deployment for production")
+      CompatibleRuntimes:
+        - python3.11
+      CompatibleArchitectures:
+        - !Ref LambdaArchitecture
+
+  # ================================
+  # Lambda Layer (S3 for Production)
+  # ================================
+  DocumentProcessingLayerS3:
+    Type: AWS::Lambda::LayerVersion
+    Condition: UseS3Layer
+    Properties:
+      LayerName: !Sub "${ProjectName}-document-processing"
+      Description: "Document processing libraries: pdfplumber, python-docx, pandas"
+      Content:
+        S3Bucket: !Ref LayerS3Bucket
+        S3Key: !Ref LayerS3Key
+      CompatibleRuntimes:
+        - python3.11
+      CompatibleArchitectures:
+        - !Ref LambdaArchitecture
+
+  # ================================
+  # Lambda Function
+  # ================================
+  DocumentConverterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-document-converter"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: 
+        Fn::ImportValue: !Sub "${ProjectName}-task-role-arn"
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Architectures:
+        - !Ref LambdaArchitecture
+      EphemeralStorage:
+        Size: 2048  # 2GB for document processing
+      Environment:
+        Variables:
+          # Import values from infrastructure stack
+          MARKDOWN_BUCKET_NAME: 
+            Fn::ImportValue: !Sub "${ProjectName}-markdown-bucket-name"
+          LOG_LEVEL: INFO
+          ENABLE_DETAILED_MONITORING: 
+            Fn::ImportValue: !Sub "${ProjectName}-enable-monitoring"
+          SNS_TOPIC_ARN: !If 
+            - HasNotificationTopic
+            - Fn::ImportValue: !Sub "${ProjectName}-failure-topic-arn"
+            - ""
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          MAX_FILE_SIZE_MB: !Ref MaxFileSizeMB
+          ENABLE_IMAGE_PROCESSING: !Ref EnableImageProcessing
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          AWS_DEPLOYMENT_REGION: !Ref AWS::Region
+      Layers:
+        - !If 
+          - UseInlineLayer
+          - !Ref DocumentProcessingLayerInline
+          - !Ref DocumentProcessingLayerS3
+      Code: !If
+        - UseInlineCode
+        - ZipFile: |
+            import json
+            import boto3
+            import logging
+            import os
+            import tempfile
+            import time
+            import re
+            from datetime import datetime
+            from urllib.parse import unquote_plus
+
+            # Configure logging
+            logger = logging.getLogger()
+            logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+            # Initialize AWS clients
+            s3_client = boto3.client('s3')
+            
+            # Conditional imports for monitoring
+            try:
+                if os.environ.get('ENABLE_DETAILED_MONITORING') == 'true':
+                    cloudwatch = boto3.client('cloudwatch')
+                else:
+                    cloudwatch = None
+            except:
+                cloudwatch = None
+
+            try:
+                if os.environ.get('SNS_TOPIC_ARN'):
+                    sns_client = boto3.client('sns')
+                else:
+                    sns_client = None
+            except:
+                sns_client = None
+
+            def lambda_handler(event, context):
+                """Main Lambda handler for document conversion with table preservation"""
+                
+                try:
+                    # Log the incoming event for debugging
+                    logger.info(f"Received event: {json.dumps(event, default=str)}")
+                    
+                    # Handle different event sources
+                    if 'Records' not in event:
+                        logger.error("No Records found in event")
+                        return {
+                            'statusCode': 400,
+                            'body': json.dumps('Invalid event format - no Records')
+                        }
+                    
+                    processed_files = []
+                    
+                    for record in event['Records']:
+                        try:
+                            # Parse S3 event
+                            bucket_name = record['s3']['bucket']['name']
+                            object_key = unquote_plus(record['s3']['object']['key'])
+                            event_name = record['eventName']
+                            
+                            logger.info(f"Processing {event_name}: s3://{bucket_name}/{object_key}")
+                            
+                            # Check file size
+                            max_size_bytes = int(os.environ.get('MAX_FILE_SIZE_MB', 50)) * 1024 * 1024
+                            object_size = record['s3']['object'].get('size', 0)
+                            
+                            if object_size > max_size_bytes:
+                                logger.warning(f"File too large: {object_size} bytes > {max_size_bytes} bytes")
+                                continue
+                            
+                            # Process the document
+                            start_time = time.time()
+                            result = process_document(bucket_name, object_key)
+                            processing_time = time.time() - start_time
+                            
+                            # Log metrics
+                            log_conversion_metrics(
+                                source_file=f"s3://{bucket_name}/{object_key}",
+                                file_type=result['file_type'],
+                                success=True,
+                                processing_time=processing_time,
+                                tables_found=result.get('tables_found', 0),
+                                file_size=object_size
+                            )
+                            
+                            # Publish CloudWatch metrics
+                            if cloudwatch:
+                                publish_custom_metrics(
+                                    result['file_type'], 
+                                    True, 
+                                    processing_time, 
+                                    result.get('tables_found', 0)
+                                )
+                            
+                            processed_files.append(result)
+                            logger.info(f"Conversion completed in {processing_time:.2f}s: {result}")
+                            
+                        except Exception as record_error:
+                            logger.error(f"Failed to process record: {record_error}", exc_info=True)
+                            
+                            # Try to send notification for this specific failure
+                            try:
+                                bucket_name = record.get('s3', {}).get('bucket', {}).get('name', 'unknown')
+                                object_key = record.get('s3', {}).get('object', {}).get('key', 'unknown')
+                                send_failure_notification(f"s3://{bucket_name}/{object_key}", str(record_error))
+                            except:
+                                pass  # Don't fail the entire function due to notification errors
+                            
+                            continue  # Process other records
+                    
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps({
+                            'message': 'Conversion completed',
+                            'processed_files': len(processed_files),
+                            'results': processed_files
+                        }, default=str)
+                    }
+                    
+                except Exception as e:
+                    error_msg = f"Lambda execution failed: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    
+                    # Send failure notification
+                    send_failure_notification("Lambda execution", error_msg)
+                    
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps(f'Error: {str(e)}')
+                    }
+
+            def process_document(source_bucket, object_key):
+                """Process document with table preservation focus"""
+                
+                # Download file to /tmp
+                filename = os.path.basename(object_key)
+                local_file_path = f"/tmp/{filename}"
+                
+                try:
+                    s3_client.download_file(source_bucket, object_key, local_file_path)
+                    
+                    # Get file size for metrics
+                    file_size = os.path.getsize(local_file_path)
+                    logger.info(f"Processing file: {filename} ({file_size} bytes)")
+                    
+                    # Detect file type
+                    file_type = detect_file_type(object_key)
+                    
+                    # For now, return a placeholder response until we add the processing libraries
+                    markdown_content = f"""# Placeholder Conversion
+            
+            **Source File**: {object_key}
+            **File Type**: {file_type}
+            **File Size**: {file_size} bytes
+            **Conversion Time**: {datetime.now().isoformat()}
+            
+            ## Note
+            This is a placeholder conversion. The actual document processing libraries 
+            (pdfplumber, python-docx) will be added via Lambda Layer in production deployment.
+            
+            ## Next Steps
+            1. Build and deploy the Lambda Layer with document processing libraries
+            2. Update this function code with actual conversion logic
+            3. Test with real documents
+            """
+                    
+                    tables_found = 0  # Placeholder
+                    
+                    # Post-process
+                    cleaned_markdown = post_process_markdown(markdown_content, object_key, tables_found)
+                    
+                    # Upload result
+                    markdown_key = object_key.rsplit('.', 1)[0] + '.md'
+                    target_bucket = os.environ['MARKDOWN_BUCKET_NAME']
+                    
+                    s3_client.put_object(
+                        Bucket=target_bucket,
+                        Key=markdown_key,
+                        Body=cleaned_markdown.encode('utf-8'),
+                        ContentType='text/markdown',
+                        Metadata={
+                            'source-bucket': source_bucket,
+                            'source-key': object_key,
+                            'conversion-timestamp': str(int(time.time())),
+                            'source-file-type': file_type,
+                            'tables-preserved': str(tables_found),
+                            'file-size-bytes': str(file_size),
+                            'converter-version': 'placeholder-v1.0'
+                        }
+                    )
+                    
+                    logger.info(f"Placeholder conversion: {object_key} -> {markdown_key}")
+                    
+                    return {
+                        'source_file': f"s3://{source_bucket}/{object_key}",
+                        'markdown_file': f"s3://{target_bucket}/{markdown_key}",
+                        'file_type': file_type,
+                        'status': 'success',
+                        'tables_found': tables_found,
+                        'file_size': file_size,
+                        'note': 'Placeholder conversion - deploy Lambda Layer for full functionality'
+                    }
+                    
+                finally:
+                    # Cleanup
+                    if os.path.exists(local_file_path):
+                        os.remove(local_file_path)
+
+            def detect_file_type(file_key):
+                """Simple file type detection based on extension"""
+                extension = file_key.lower().split('.')[-1]
+                
+                if extension == 'pdf':
+                    return 'pdf'
+                elif extension == 'docx':
+                    return 'docx'
+                else:
+                    raise ValueError(f"Unsupported file extension: {extension}")
+
+            def post_process_markdown(raw_markdown, source_filename, tables_found):
+                """Clean up markdown with focus on table formatting"""
+                
+                # Add metadata header
+                metadata = f"""---
+            source_file: {source_filename}
+            converted_date: {datetime.now().isoformat()}
+            conversion_tool: aws-lambda-table-converter
+            converter_version: placeholder-v1.0
+            features: ["text-extraction", "table-preservation"]
+            tables_found: {tables_found}
+            environment: {os.environ.get('ENVIRONMENT', 'unknown')}
+            ---
+
+            """
+                
+                return metadata + raw_markdown.strip()
+
+            def log_conversion_metrics(source_file, file_type, success, processing_time, tables_found=0, file_size=0):
+                """Log structured metrics for monitoring"""
+                metrics = {
+                    'source_file': source_file,
+                    'file_type': file_type,
+                    'success': success,
+                    'processing_time_seconds': round(processing_time, 2),
+                    'tables_found': tables_found,
+                    'file_size_bytes': file_size,
+                    'timestamp': datetime.now().isoformat(),
+                    'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                    'converter_version': 'placeholder-v1.0'
+                }
+                
+                logger.info(f"CONVERSION_METRICS: {json.dumps(metrics)}")
+
+            def publish_custom_metrics(file_type, success, processing_time, tables_found):
+                """Publish custom metrics to CloudWatch"""
+                if not cloudwatch:
+                    return
+                    
+                try:
+                    cloudwatch.put_metric_data(
+                        Namespace='DocumentConverter',
+                        MetricData=[
+                            {
+                                'MetricName': 'ConversionsTotal',
+                                'Dimensions': [
+                                    {'Name': 'FileType', 'Value': file_type},
+                                    {'Name': 'Status', 'Value': 'Success' if success else 'Failed'},
+                                    {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
+                                ],
+                                'Value': 1,
+                                'Unit': 'Count'
+                            },
+                            {
+                                'MetricName': 'ProcessingTime',
+                                'Dimensions': [
+                                    {'Name': 'FileType', 'Value': file_type},
+                                    {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
+                                ],
+                                'Value': processing_time,
+                                'Unit': 'Seconds'
+                            },
+                            {
+                                'MetricName': 'TablesFound',
+                                'Dimensions': [
+                                    {'Name': 'FileType', 'Value': file_type},
+                                    {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
+                                ],
+                                'Value': tables_found,
+                                'Unit': 'Count'
+                            }
+                        ]
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to publish CloudWatch metrics: {e}")
+
+            def send_failure_notification(source_identifier, error_message):
+                """Send failure notification via SNS"""
+                if not sns_client or not os.environ.get('SNS_TOPIC_ARN'):
+                    return
+                    
+                try:
+                    message = f"""Document Conversion Failure
+
+            Source: {source_identifier}
+            Error: {error_message}
+            Environment: {os.environ.get('ENVIRONMENT', 'unknown')}
+            Function: {os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')}
+            Region: {os.environ.get('AWS_DEPLOYMENT_REGION', 'unknown')}
+            Timestamp: {datetime.now().isoformat()}
+
+            Please check the CloudWatch logs for more details:
+            Log Group: {os.environ.get('AWS_LAMBDA_LOG_GROUP_NAME', 'unknown')}
+            """
+                    
+                    sns_client.publish(
+                        TopicArn=os.environ['SNS_TOPIC_ARN'],
+                        Subject=f"Document Conversion Failed - {os.environ.get('PROJECT_NAME', 'Unknown')}",
+                        Message=message
+                    )
+                except Exception as sns_error:
+                    logger.error(f"Failed to send SNS notification: {sns_error}")
+
+        - S3Bucket: !Ref CodeS3Bucket
+          S3Key: !Ref CodeS3Key
+      DeadLetterConfig:
+        TargetArn: !GetAtt FailureQueue.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-document-converter"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stack
+          Value: lambda
+
+  # ================================
+  # Lambda Permissions for S3 Trigger
+  # ================================
+  DocumentConverterS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentConverterFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: 
+        Fn::ImportValue: !Sub "${ProjectName}-source-bucket-arn"
+      SourceAccount: !Ref AWS::AccountId
+
+  # ================================
+  # S3 Bucket Notifications (connects to existing bucket)
+  # ================================
+  SourceBucketNotificationConfiguration:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 
+        Fn::ImportValue: !Sub "${ProjectName}-source-bucket-name"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentConverterFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentConverterFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .docx
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentConverterFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .doc
+
+  # ================================
+  # Dead Letter Queue for Failed Invocations
+  # ================================
+  FailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-conversion-failures"
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeoutSeconds: 60
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-failure-queue"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # CloudWatch Alarms for Monitoring
+  # ================================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-errors"
+      AlarmDescription: "Lambda function errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentConverterFunction
+      AlarmActions: !If
+        - HasNotificationTopic
+        - - Fn::ImportValue: !Sub "${ProjectName}-failure-topic-arn"
+        - !Ref AWS::NoValue
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-duration"
+      AlarmDescription: "Lambda function duration approaching timeout"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Sub "${LambdaTimeout}000"  # Convert to milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentConverterFunction
+      TreatMissingData: notBreaching
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-lambda-throttles"
+      AlarmDescription: "Lambda function throttles"
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentConverterFunction
+
+  # ================================
+  # Lambda Function URL (Optional - for testing)
+  # ================================
+  DocumentConverterFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref DocumentConverterFunction
+      AuthType: NONE
+      Cors:
+        AllowCredentials: false
+        AllowMethods:
+          - POST
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - content-type
+        MaxAge: 86400
+
+# ================================
+# Outputs
+# ================================
+Outputs:
+  # Lambda Function Information
+  LambdaFunctionName:
+    Description: Name of the document converter Lambda function
+    Value: !Ref DocumentConverterFunction
+    Export:
+      Name: !Sub "${ProjectName}-lambda-function-name"
+
+  LambdaFunctionArn:
+    Description: ARN of the document converter Lambda function
+    Value: !GetAtt DocumentConverterFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-lambda-function-arn"
+
+  # Layer Information
+  LayerArn:
+    Description: ARN of the document processing layer
+    Value: !If
+      - UseInlineLayer
+      - !Ref DocumentProcessingLayerInline
+      - !Ref DocumentProcessingLayerS3
+    Export:
+      Name: !Sub "${ProjectName}-layer-arn"
+
+  LayerVersion:
+    Description: Version of the document processing layer
+    Value: !If
+      - UseInlineLayer
+      - !GetAtt DocumentProcessingLayerInline.Version
+      - !GetAtt DocumentProcessingLayerS3.Version
+    Export:
+      Name: !Sub "${ProjectName}-layer-version"
+
+  # Queue Information
+  FailureQueueUrl:
+    Description: URL of the failure queue for dead letter messages
+    Value: !GetAtt FailureQueue.QueueUrl
+    Export:
+      Name: !Sub "${ProjectName}-failure-queue-url"
+
+  FailureQueueArn:
+    Description: ARN of the failure queue
+    Value: !GetAtt FailureQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-failure-queue-arn"
+
+  # Function URL (for testing)
+  FunctionUrl:
+    Description: Lambda Function URL for direct testing
+    Value: !GetAtt DocumentConverterFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub "${ProjectName}-function-url"
+
+  # Configuration Summary
+  LambdaConfiguration:
+    Description: Summary of Lambda configuration
+    Value: !Sub "${LambdaMemorySize}MB memory, ${LambdaTimeout}s timeout, ${LambdaArchitecture} architecture"
+    Export:
+      Name: !Sub "${ProjectName}-lambda-config"
+
+  ProcessingConfiguration:
+    Description: Document processing configuration
+    Value: !Sub "Max file size: ${MaxFileSizeMB}MB, Image processing: ${EnableImageProcessing}"
+    Export:
+      Name: !Sub "${ProjectName}-processing-config"
+
+  # Monitoring Endpoints
+  CloudWatchLogGroup:
+    Description: CloudWatch log group for Lambda function
+    Value: 
+      Fn::ImportValue: !Sub "${ProjectName}-log-group-name"
+    Export:
+      Name: !Sub "${ProjectName}-lambda-log-group"
+
+  # Cross-Stack References Used
+  ReferencedInfrastructureStack:
+    Description: Infrastructure stack components referenced
+    Value: !Sub "${ProjectName}-infrastructure"
+    Export:
+      Name: !Sub "${ProjectName}-infrastructure-reference"
