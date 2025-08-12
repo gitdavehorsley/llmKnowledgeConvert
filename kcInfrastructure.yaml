@@ -97,18 +97,6 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
-      LifecycleConfiguration:
-        Rules:
-          - Id: ArchiveSourceDocuments
-            Status: Enabled
-            Transitions:
-              - TransitionInDays: !Ref SourceDocumentRetentionDays
-                StorageClass: GLACIER
-            NoncurrentVersionTransitions:
-              - TransitionInDays: 30
-                StorageClass: STANDARD_IA
-              - TransitionInDays: 60
-                StorageClass: GLACIER
       # Note: Notification configuration will be added by Lambda stack
       Tags:
         - Key: Name
@@ -138,18 +126,6 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
-      LifecycleConfiguration:
-        Rules:
-          - Id: OptimizeMarkdownStorage
-            Status: Enabled
-            Transitions:
-              - TransitionInDays: !Ref MarkdownRetentionDays
-                StorageClass: STANDARD_IA
-            NoncurrentVersionTransitions:
-              - TransitionInDays: 7
-                StorageClass: STANDARD_IA
-              - TransitionInDays: 30
-                StorageClass: GLACIER
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-markdown-output"
