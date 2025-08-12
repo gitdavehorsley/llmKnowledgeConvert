@@ -50,22 +50,7 @@ Parameters:
     Default: ""
     Description: Email for conversion failure notifications (optional)
     
-  # ================================
-  # Lifecycle Management
-  # ================================
-  SourceDocumentRetentionDays:
-    Type: Number
-    Default: 90
-    MinValue: 30
-    MaxValue: 365
-    Description: Days to keep source documents before archiving to Glacier
-    
-  MarkdownRetentionDays:
-    Type: Number
-    Default: 30
-    MinValue: 7
-    MaxValue: 365
-    Description: Days to keep markdown files in Standard storage before moving to IA
+  
 
 Conditions:
   CreateSourceBucketName: !Equals [!Ref SourceBucketName, ""]
