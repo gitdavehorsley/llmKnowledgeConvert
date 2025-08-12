@@ -1,0 +1,547 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Document Conversion Infrastructure Stack - S3 Buckets, IAM Roles, Monitoring (Stack 1 of 2)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: knowledge-converter
+    Description: Project name used for resource naming and cross-stack exports
+    
+  Environment:
+    Type: String
+    Default: poc
+    AllowedValues: 
+      - poc
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+    
+  # ================================
+  # S3 Configuration
+  # ================================
+  SourceBucketName:
+    Type: String
+    Default: ""
+    Description: Source bucket name (leave empty to auto-generate)
+    
+  MarkdownBucketName:
+    Type: String
+    Default: ""
+    Description: Markdown output bucket name (leave empty to auto-generate)
+    
+  EnableVersioning:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable S3 versioning on both buckets
+    
+  # ================================
+  # Monitoring Configuration
+  # ================================
+  EnableDetailedMonitoring:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable detailed CloudWatch monitoring and custom metrics
+    
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email for conversion failure notifications (optional)
+    
+  # ================================
+  # Lifecycle Management
+  # ================================
+  SourceDocumentRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 365
+    Description: Days to keep source documents before archiving to Glacier
+    
+  MarkdownRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 365
+    Description: Days to keep markdown files in Standard storage before moving to IA
+
+Conditions:
+  CreateSourceBucketName: !Equals [!Ref SourceBucketName, ""]
+  CreateMarkdownBucketName: !Equals [!Ref MarkdownBucketName, ""]
+  EnableVersioningCondition: !Equals [!Ref EnableVersioning, "true"]
+  EnableMonitoring: !Equals [!Ref EnableDetailedMonitoring, "true"]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+Resources:
+
+  # ================================
+  # S3 Buckets
+  # ================================
+  SourceDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateSourceBucketName
+        - !Sub "${ProjectName}-source-docs-${AWS::AccountId}-${AWS::Region}"
+        - !Ref SourceBucketName
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, "Enabled", "Suspended"]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveSourceDocuments
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref SourceDocumentRetentionDays
+                StorageClass: GLACIER
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 60
+                StorageClass: GLACIER
+      # Note: Notification configuration will be added by Lambda stack
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-source-documents"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Document conversion source storage"
+
+  MarkdownOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If 
+        - CreateMarkdownBucketName
+        - !Sub "${ProjectName}-markdown-output-${AWS::AccountId}-${AWS::Region}"
+        - !Ref MarkdownBucketName
+      VersioningConfiguration:
+        Status: !If [EnableVersioningCondition, "Enabled", "Suspended"]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: OptimizeMarkdownStorage
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: !Ref MarkdownRetentionDays
+                StorageClass: STANDARD_IA
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 7
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-markdown-output"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: "Converted markdown documents for knowledge base"
+
+  # ================================
+  # IAM Roles for Lambda Function
+  # ================================
+  DocumentConverterExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-document-converter-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-execution-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DocumentConverterTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-document-converter-task-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadSourceDocuments
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectTagging
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:s3:::${SourceDocumentsBucket}/*"
+              - Sid: WriteMarkdownOutput
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:s3:::${MarkdownOutputBucket}/*"
+              - Sid: ListBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt SourceDocumentsBucket.Arn
+                  - !GetAtt MarkdownOutputBucket.Arn
+        - !If
+          - EnableMonitoring
+          - PolicyName: CloudWatchMetrics
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: PublishCustomMetrics
+                  Effect: Allow
+                  Action:
+                    - cloudwatch:PutMetricData
+                  Resource: "*"
+                  Condition:
+                    StringEquals:
+                      "cloudwatch:namespace": "DocumentConverter"
+          - !Ref AWS::NoValue
+        - !If
+          - HasNotificationEmail
+          - PolicyName: SNSNotifications
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: PublishFailureNotifications
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref FailureNotificationTopic
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-task-role"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # CloudWatch Log Group
+  # ================================
+  DocumentConverterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-document-converter"
+      RetentionInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-logs"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
+  # SNS Topic for Failure Notifications
+  # ================================
+  FailureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      TopicName: !Sub "${ProjectName}-conversion-failures"
+      DisplayName: !Sub "${ProjectName} Document Conversion Failures"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-failure-notifications"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FailureNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref FailureNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ================================
+  # CloudWatch Dashboard (if monitoring enabled)
+  # ================================
+  ConversionDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: EnableMonitoring
+    Properties:
+      DashboardName: !Sub "${ProjectName}-document-conversion"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "DocumentConverter", "ConversionsTotal", "Status", "Success" ],
+                  [ ".", ".", ".", "Failed" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Document Conversion Success Rate",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "DocumentConverter", "ProcessingTime", "FileType", "pdf" ],
+                  [ ".", ".", ".", "docx" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Average Processing Time by File Type",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "DocumentConverter", "TablesFound", "FileType", "pdf" ],
+                  [ ".", ".", ".", "docx" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Tables Preserved by File Type",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-document-converter'\n| fields @timestamp, @message\n| filter @message like /CONVERSION_METRICS/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Conversion Activity",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ================================
+  # Systems Manager Parameters (Alternative to Exports)
+  # ================================
+  SourceBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/source-bucket-name"
+      Type: String
+      Value: !Ref SourceDocumentsBucket
+      Description: !Sub "Source documents bucket name for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  MarkdownBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/markdown-bucket-name"
+      Type: String
+      Value: !Ref MarkdownOutputBucket
+      Description: !Sub "Markdown output bucket name for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  ExecutionRoleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/execution-role-arn"
+      Type: String
+      Value: !GetAtt DocumentConverterExecutionRole.Arn
+      Description: !Sub "Lambda execution role ARN for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  TaskRoleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/task-role-arn"
+      Type: String
+      Value: !GetAtt DocumentConverterTaskRole.Arn
+      Description: !Sub "Lambda task role ARN for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  LogGroupParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/log-group-name"
+      Type: String
+      Value: !Ref DocumentConverterLogGroup
+      Description: !Sub "CloudWatch log group name for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ================================
+  # Outputs (for cross-stack references)
+  # ================================
+Outputs:
+  # S3 Bucket Information
+  SourceBucketName:
+    Description: Name of the source documents bucket
+    Value: !Ref SourceDocumentsBucket
+    Export:
+      Name: !Sub "${ProjectName}-source-bucket-name"
+
+  SourceBucketArn:
+    Description: ARN of the source documents bucket
+    Value: !GetAtt SourceDocumentsBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-source-bucket-arn"
+
+  MarkdownBucketName:
+    Description: Name of the markdown output bucket
+    Value: !Ref MarkdownOutputBucket
+    Export:
+      Name: !Sub "${ProjectName}-markdown-bucket-name"
+
+  MarkdownBucketArn:
+    Description: ARN of the markdown output bucket
+    Value: !GetAtt MarkdownOutputBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-markdown-bucket-arn"
+
+  # IAM Role Information
+  DocumentConverterExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt DocumentConverterExecutionRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-execution-role-arn"
+
+  DocumentConverterTaskRoleArn:
+    Description: ARN of the Lambda task role (for S3 and CloudWatch access)
+    Value: !GetAtt DocumentConverterTaskRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-task-role-arn"
+
+  # CloudWatch Resources
+  LogGroupName:
+    Description: Name of the CloudWatch log group for Lambda function
+    Value: !Ref DocumentConverterLogGroup
+    Export:
+      Name: !Sub "${ProjectName}-log-group-name"
+
+  LogGroupArn:
+    Description: ARN of the CloudWatch log group
+    Value: !GetAtt DocumentConverterLogGroup.Arn
+    Export:
+      Name: !Sub "${ProjectName}-log-group-arn"
+
+  # SNS Information (conditional)
+  FailureNotificationTopicArn:
+    Condition: HasNotificationEmail
+    Description: ARN of the SNS topic for failure notifications
+    Value: !Ref FailureNotificationTopic
+    Export:
+      Name: !Sub "${ProjectName}-failure-topic-arn"
+
+  # Configuration Information
+  ProjectName:
+    Description: Project name for use in dependent stacks
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub "${ProjectName}-project-name"
+
+  Environment:
+    Description: Environment name for use in dependent stacks
+    Value: !Ref Environment
+    Export:
+      Name: !Sub "${ProjectName}-environment"
+
+  EnableDetailedMonitoring:
+    Description: Whether detailed monitoring is enabled
+    Value: !Ref EnableDetailedMonitoring
+    Export:
+      Name: !Sub "${ProjectName}-enable-monitoring"
+
+  # Dashboard Information (conditional)
+  DashboardName:
+    Condition: EnableMonitoring
+    Description: Name of the CloudWatch dashboard
+    Value: !Ref ConversionDashboard
+    Export:
+      Name: !Sub "${ProjectName}-dashboard-name"
+
+  # Region and Account Info
+  DeploymentRegion:
+    Description: AWS Region where infrastructure is deployed
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub "${ProjectName}-deployment-region"
+
+  AccountId:
+    Description: AWS Account ID where infrastructure is deployed
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub "${ProjectName}-account-id"
