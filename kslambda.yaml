@@ -99,10 +99,17 @@ Conditions:
   UseS3Layer: !Equals [!Ref LayerDeploymentMethod, "s3"]
   UseInlineCode: !Equals [!Ref DeploymentPackageMethod, "inline"]
   UseS3Code: !Equals [!Ref DeploymentPackageMethod, "s3"]
-  HasMonitoring: 
-    Fn::ImportValue: !Sub "${ProjectName}-enable-monitoring"
-  HasNotificationTopic: !Not [!Equals [!ImportValue 
-    !Sub "${ProjectName}-failure-topic-arn", ""]]
+  HasMonitoring:
+    Fn::Equals:
+      - Fn::ImportValue:
+          Fn::Sub: "${ProjectName}-enable-monitoring"
+      - "true"
+  HasNotificationTopic:
+    Fn::Not:
+      - Fn::Equals:
+          - Fn::ImportValue:
+              Fn::Sub: "${ProjectName}-failure-topic-arn"
+          - ""
 
 Resources:
 
