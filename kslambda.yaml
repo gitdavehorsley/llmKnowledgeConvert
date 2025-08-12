@@ -93,23 +93,22 @@ Parameters:
     Type: String
     Default: "lambda/document-converter.zip"
     Description: S3 key for Lambda code zip (only needed if DeploymentPackageMethod=s3)
+    
+  # ================================
+  # Notifications Configuration
+  # ================================
+  EnableNotifications:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Whether to enable SNS notifications and wire alarms to the imported topic
 
 Conditions:
   UseInlineLayer: !Equals [!Ref LayerDeploymentMethod, "inline"]
   UseS3Layer: !Equals [!Ref LayerDeploymentMethod, "s3"]
   UseInlineCode: !Equals [!Ref DeploymentPackageMethod, "inline"]
   UseS3Code: !Equals [!Ref DeploymentPackageMethod, "s3"]
-  HasMonitoring:
-    Fn::Equals:
-      - Fn::ImportValue:
-          Fn::Sub: "${ProjectName}-enable-monitoring"
-      - "true"
-  HasNotificationTopic:
-    Fn::Not:
-      - Fn::Equals:
-          - Fn::ImportValue:
-              Fn::Sub: "${ProjectName}-failure-topic-arn"
-          - ""
+  HasNotificationTopic: !Equals [!Ref EnableNotifications, "true"]
 
 Resources:
 
@@ -175,9 +174,7 @@ Resources:
             Fn::ImportValue:
               Fn::Sub: "${ProjectName}-markdown-bucket-name"
           LOG_LEVEL: INFO
-          ENABLE_DETAILED_MONITORING: 
-            Fn::ImportValue:
-              Fn::Sub: "${ProjectName}-enable-monitoring"
+          ENABLE_DETAILED_MONITORING: "false"
           SNS_TOPIC_ARN: !If 
             - HasNotificationTopic
             - Fn::ImportValue:
