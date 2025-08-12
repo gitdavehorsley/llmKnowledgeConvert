@@ -160,7 +160,8 @@ Resources:
       Runtime: python3.11
       Handler: index.lambda_handler
       Role: 
-        Fn::ImportValue: !Sub "${ProjectName}-task-role-arn"
+        Fn::ImportValue:
+          Fn::Sub: "${ProjectName}-task-role-arn"
       MemorySize: !Ref LambdaMemorySize
       Timeout: !Ref LambdaTimeout
       Architectures:
@@ -171,13 +172,16 @@ Resources:
         Variables:
           # Import values from infrastructure stack
           MARKDOWN_BUCKET_NAME: 
-            Fn::ImportValue: !Sub "${ProjectName}-markdown-bucket-name"
+            Fn::ImportValue:
+              Fn::Sub: "${ProjectName}-markdown-bucket-name"
           LOG_LEVEL: INFO
           ENABLE_DETAILED_MONITORING: 
-            Fn::ImportValue: !Sub "${ProjectName}-enable-monitoring"
+            Fn::ImportValue:
+              Fn::Sub: "${ProjectName}-enable-monitoring"
           SNS_TOPIC_ARN: !If 
             - HasNotificationTopic
-            - Fn::ImportValue: !Sub "${ProjectName}-failure-topic-arn"
+            - Fn::ImportValue:
+                Fn::Sub: "${ProjectName}-failure-topic-arn"
             - ""
           PROJECT_NAME: !Ref ProjectName
           ENVIRONMENT: !Ref Environment
@@ -537,7 +541,8 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
       SourceArn: 
-        Fn::ImportValue: !Sub "${ProjectName}-source-bucket-arn"
+        Fn::ImportValue:
+          Fn::Sub: "${ProjectName}-source-bucket-arn"
       SourceAccount: !Ref AWS::AccountId
 
   # ================================
@@ -547,7 +552,8 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: 
-        Fn::ImportValue: !Sub "${ProjectName}-source-bucket-name"
+        Fn::ImportValue:
+          Fn::Sub: "${ProjectName}-source-bucket-name"
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: s3:ObjectCreated:*
@@ -610,7 +616,8 @@ Resources:
           Value: !Ref DocumentConverterFunction
       AlarmActions: !If
         - HasNotificationTopic
-        - - Fn::ImportValue: !Sub "${ProjectName}-failure-topic-arn"
+        - - Fn::ImportValue:
+              Fn::Sub: "${ProjectName}-failure-topic-arn"
         - !Ref AWS::NoValue
 
   LambdaDurationAlarm:
@@ -737,7 +744,8 @@ Outputs:
   CloudWatchLogGroup:
     Description: CloudWatch log group for Lambda function
     Value: 
-      Fn::ImportValue: !Sub "${ProjectName}-log-group-name"
+      Fn::ImportValue:
+        Fn::Sub: "${ProjectName}-log-group-name"
     Export:
       Name: !Sub "${ProjectName}-lambda-log-group"
 
