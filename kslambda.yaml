@@ -194,325 +194,76 @@ Resources:
       Code: !If
         - UseInlineCode
         - ZipFile: |
-            import json
-            import boto3
-            import logging
-            import os
-            import tempfile
-            import time
-            import re
-            from datetime import datetime
+            import os, json, boto3
             from urllib.parse import unquote_plus
 
-            # Configure logging
-            logger = logging.getLogger()
-            logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
-
-            # Initialize AWS clients
-            s3_client = boto3.client('s3')
-            
-            # Conditional imports for monitoring
-            try:
-                if os.environ.get('ENABLE_DETAILED_MONITORING') == 'true':
-                    cloudwatch = boto3.client('cloudwatch')
-                else:
-                    cloudwatch = None
-            except:
-                cloudwatch = None
-
-            try:
-                if os.environ.get('SNS_TOPIC_ARN'):
-                    sns_client = boto3.client('sns')
-                else:
-                    sns_client = None
-            except:
-                sns_client = None
+            s3 = boto3.client('s3')
+            MARKDOWN_BUCKET = os.environ.get('MARKDOWN_BUCKET_NAME', '')
 
             def lambda_handler(event, context):
-                """Main Lambda handler for document conversion with table preservation"""
-                
-                try:
-                    # Log the incoming event for debugging
-                    logger.info(f"Received event: {json.dumps(event, default=str)}")
-                    
-                    # Handle different event sources
-                    if 'Records' not in event:
-                        logger.error("No Records found in event")
-                        return {
-                            'statusCode': 400,
-                            'body': json.dumps('Invalid event format - no Records')
-                        }
-                    
-                    processed_files = []
-                    
-                    for record in event['Records']:
-                        try:
-                            # Parse S3 event
-                            bucket_name = record['s3']['bucket']['name']
-                            object_key = unquote_plus(record['s3']['object']['key'])
-                            event_name = record['eventName']
-                            
-                            logger.info(f"Processing {event_name}: s3://{bucket_name}/{object_key}")
-                            
-                            # Check file size
-                            max_size_bytes = int(os.environ.get('MAX_FILE_SIZE_MB', 50)) * 1024 * 1024
-                            object_size = record['s3']['object'].get('size', 0)
-                            
-                            if object_size > max_size_bytes:
-                                logger.warning(f"File too large: {object_size} bytes > {max_size_bytes} bytes")
-                                continue
-                            
-                            # Process the document
-                            start_time = time.time()
-                            result = process_document(bucket_name, object_key)
-                            processing_time = time.time() - start_time
-                            
-                            # Log metrics
-                            log_conversion_metrics(
-                                source_file=f"s3://{bucket_name}/{object_key}",
-                                file_type=result['file_type'],
-                                success=True,
-                                processing_time=processing_time,
-                                tables_found=result.get('tables_found', 0),
-                                file_size=object_size
-                            )
-                            
-                            # Publish CloudWatch metrics
-                            if cloudwatch:
-                                publish_custom_metrics(
-                                    result['file_type'], 
-                                    True, 
-                                    processing_time, 
-                                    result.get('tables_found', 0)
-                                )
-                            
-                            processed_files.append(result)
-                            logger.info(f"Conversion completed in {processing_time:.2f}s: {result}")
-                            
-                        except Exception as record_error:
-                            logger.error(f"Failed to process record: {record_error}", exc_info=True)
-                            
-                            # Try to send notification for this specific failure
+                """
+                Process SQS messages containing S3 events
+                Each SQS message contains an S3 event in its body
+                """
+                results = []
+
+                # Process each SQS message
+                for sqs_record in event.get('Records', []):
+                    try:
+                        # Parse the S3 event from the SQS message body
+                        s3_event = json.loads(sqs_record['body'])
+
+                        # Process each S3 record in the event
+                        for s3_record in s3_event.get('Records', []):
                             try:
-                                bucket_name = record.get('s3', {}).get('bucket', {}).get('name', 'unknown')
-                                object_key = record.get('s3', {}).get('object', {}).get('key', 'unknown')
-                                send_failure_notification(f"s3://{bucket_name}/{object_key}", str(record_error))
-                            except:
-                                pass  # Don't fail the entire function due to notification errors
-                            
-                            continue  # Process other records
-                    
-                    return {
-                        'statusCode': 200,
-                        'body': json.dumps({
-                            'message': 'Conversion completed',
-                            'processed_files': len(processed_files),
-                            'results': processed_files
-                        }, default=str)
-                    }
-                    
-                except Exception as e:
-                    error_msg = f"Lambda execution failed: {str(e)}"
-                    logger.error(error_msg, exc_info=True)
-                    
-                    # Send failure notification
-                    send_failure_notification("Lambda execution", error_msg)
-                    
-                    return {
-                        'statusCode': 500,
-                        'body': json.dumps(f'Error: {str(e)}')
-                    }
+                                b = s3_record['s3']['bucket']['name']
+                                k = unquote_plus(s3_record['s3']['object']['key'])
 
-            def process_document(source_bucket, object_key):
-                """Process document with table preservation focus"""
-                
-                # Download file to /tmp
-                filename = os.path.basename(object_key)
-                local_file_path = f"/tmp/{filename}"
-                
-                try:
-                    s3_client.download_file(source_bucket, object_key, local_file_path)
-                    
-                    # Get file size for metrics
-                    file_size = os.path.getsize(local_file_path)
-                    logger.info(f"Processing file: {filename} ({file_size} bytes)")
-                    
-                    # Detect file type
-                    file_type = detect_file_type(object_key)
-                    
-                    # For now, return a placeholder response until we add the processing libraries
-                    markdown_content = f"""# Placeholder Conversion
-            
-            **Source File**: {object_key}
-            **File Type**: {file_type}
-            **File Size**: {file_size} bytes
-            **Conversion Time**: {datetime.now().isoformat()}
-            
-            ## Note
-            This is a placeholder conversion. The actual document processing libraries 
-            (pdfplumber, python-docx) will be added via Lambda Layer in production deployment.
-            
-            ## Next Steps
-            1. Build and deploy the Lambda Layer with document processing libraries
-            2. Update this function code with actual conversion logic
-            3. Test with real documents
-            """
-                    
-                    tables_found = 0  # Placeholder
-                    
-                    # Post-process
-                    cleaned_markdown = post_process_markdown(markdown_content, object_key, tables_found)
-                    
-                    # Upload result
-                    markdown_key = object_key.rsplit('.', 1)[0] + '.md'
-                    target_bucket = os.environ['MARKDOWN_BUCKET_NAME']
-                    
-                    s3_client.put_object(
-                        Bucket=target_bucket,
-                        Key=markdown_key,
-                        Body=cleaned_markdown.encode('utf-8'),
-                        ContentType='text/markdown',
-                        Metadata={
-                            'source-bucket': source_bucket,
-                            'source-key': object_key,
-                            'conversion-timestamp': str(int(time.time())),
-                            'source-file-type': file_type,
-                            'tables-preserved': str(tables_found),
-                            'file-size-bytes': str(file_size),
-                            'converter-version': 'placeholder-v1.0'
-                        }
-                    )
-                    
-                    logger.info(f"Placeholder conversion: {object_key} -> {markdown_key}")
-                    
-                    return {
-                        'source_file': f"s3://{source_bucket}/{object_key}",
-                        'markdown_file': f"s3://{target_bucket}/{markdown_key}",
-                        'file_type': file_type,
-                        'status': 'success',
-                        'tables_found': tables_found,
-                        'file_size': file_size,
-                        'note': 'Placeholder conversion - deploy Lambda Layer for full functionality'
-                    }
-                    
-                finally:
-                    # Cleanup
-                    if os.path.exists(local_file_path):
-                        os.remove(local_file_path)
+                                # Skip if this is a folder or non-document file
+                                if k.endswith('/') or not any(k.lower().endswith(ext) for ext in ['.pdf', '.docx', '.doc']):
+                                    continue
 
-            def detect_file_type(file_key):
-                """Simple file type detection based on extension"""
-                extension = file_key.lower().split('.')[-1]
-                
-                if extension == 'pdf':
-                    return 'pdf'
-                elif extension == 'docx':
-                    return 'docx'
-                else:
-                    raise ValueError(f"Unsupported file extension: {extension}")
+                                md_key = k.rsplit('.', 1)[0] + '.md'
+                                body = f"# Placeholder Conversion\n\nSource: s3://{b}/{k}\n"
 
-            def post_process_markdown(raw_markdown, source_filename, tables_found):
-                """Clean up markdown with focus on table formatting"""
-                
-                # Add metadata header
-                metadata = f"""---
-            source_file: {source_filename}
-            converted_date: {datetime.now().isoformat()}
-            conversion_tool: aws-lambda-table-converter
-            converter_version: placeholder-v1.0
-            features: ["text-extraction", "table-preservation"]
-            tables_found: {tables_found}
-            environment: {os.environ.get('ENVIRONMENT', 'unknown')}
-            ---
+                                s3.put_object(
+                                    Bucket=MARKDOWN_BUCKET,
+                                    Key=md_key,
+                                    Body=body.encode('utf-8'),
+                                    ContentType='text/markdown'
+                                )
 
-            """
-                
-                return metadata + raw_markdown.strip()
+                                results.append({
+                                    'source': f's3://{b}/{k}',
+                                    'output': f's3://{MARKDOWN_BUCKET}/{md_key}',
+                                    'message_id': sqs_record.get('messageId')
+                                })
 
-            def log_conversion_metrics(source_file, file_type, success, processing_time, tables_found=0, file_size=0):
-                """Log structured metrics for monitoring"""
-                metrics = {
-                    'source_file': source_file,
-                    'file_type': file_type,
-                    'success': success,
-                    'processing_time_seconds': round(processing_time, 2),
-                    'tables_found': tables_found,
-                    'file_size_bytes': file_size,
-                    'timestamp': datetime.now().isoformat(),
-                    'environment': os.environ.get('ENVIRONMENT', 'unknown'),
-                    'converter_version': 'placeholder-v1.0'
+                            except Exception as e:
+                                results.append({
+                                    'source': s3_record.get('s3', {}),
+                                    'error': str(e),
+                                    'message_id': sqs_record.get('messageId')
+                                })
+
+                    except json.JSONDecodeError as e:
+                        results.append({
+                            'error': f'Failed to parse SQS message: {str(e)}',
+                            'message_id': sqs_record.get('messageId')
+                        })
+                    except Exception as e:
+                        results.append({
+                            'error': f'Failed to process SQS message: {str(e)}',
+                            'message_id': sqs_record.get('messageId')
+                        })
+
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'results': results,
+                        'processed_messages': len(event.get('Records', []))
+                    })
                 }
-                
-                logger.info(f"CONVERSION_METRICS: {json.dumps(metrics)}")
-
-            def publish_custom_metrics(file_type, success, processing_time, tables_found):
-                """Publish custom metrics to CloudWatch"""
-                if not cloudwatch:
-                    return
-                    
-                try:
-                    cloudwatch.put_metric_data(
-                        Namespace='DocumentConverter',
-                        MetricData=[
-                            {
-                                'MetricName': 'ConversionsTotal',
-                                'Dimensions': [
-                                    {'Name': 'FileType', 'Value': file_type},
-                                    {'Name': 'Status', 'Value': 'Success' if success else 'Failed'},
-                                    {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
-                                ],
-                                'Value': 1,
-                                'Unit': 'Count'
-                            },
-                            {
-                                'MetricName': 'ProcessingTime',
-                                'Dimensions': [
-                                    {'Name': 'FileType', 'Value': file_type},
-                                    {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
-                                ],
-                                'Value': processing_time,
-                                'Unit': 'Seconds'
-                            },
-                            {
-                                'MetricName': 'TablesFound',
-                                'Dimensions': [
-                                    {'Name': 'FileType', 'Value': file_type},
-                                    {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'unknown')}
-                                ],
-                                'Value': tables_found,
-                                'Unit': 'Count'
-                            }
-                        ]
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to publish CloudWatch metrics: {e}")
-
-            def send_failure_notification(source_identifier, error_message):
-                """Send failure notification via SNS"""
-                if not sns_client or not os.environ.get('SNS_TOPIC_ARN'):
-                    return
-                    
-                try:
-                    message = f"""Document Conversion Failure
-
-            Source: {source_identifier}
-            Error: {error_message}
-            Environment: {os.environ.get('ENVIRONMENT', 'unknown')}
-            Function: {os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'unknown')}
-            Region: {os.environ.get('AWS_DEPLOYMENT_REGION', 'unknown')}
-            Timestamp: {datetime.now().isoformat()}
-
-            Please check the CloudWatch logs for more details:
-            Log Group: {os.environ.get('AWS_LAMBDA_LOG_GROUP_NAME', 'unknown')}
-            """
-                    
-                    sns_client.publish(
-                        TopicArn=os.environ['SNS_TOPIC_ARN'],
-                        Subject=f"Document Conversion Failed - {os.environ.get('PROJECT_NAME', 'Unknown')}",
-                        Message=message
-                    )
-                except Exception as sns_error:
-                    logger.error(f"Failed to send SNS notification: {sns_error}")
 
         - S3Bucket: !Ref CodeS3Bucket
           S3Key: !Ref CodeS3Key
@@ -529,18 +280,21 @@ Resources:
           Value: lambda
 
   # ================================
-  # Lambda Permissions for S3 Trigger
+  # SQS Event Source Mapping for Lambda
   # ================================
-  DocumentConverterS3Permission:
-    Type: AWS::Lambda::Permission
+  DocumentConverterSQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
     Properties:
       FunctionName: !Ref DocumentConverterFunction
-      Action: lambda:InvokeFunction
-      Principal: s3.amazonaws.com
-      SourceArn: 
+      EventSourceArn:
         Fn::ImportValue:
-          Fn::Sub: "${ProjectName}-source-bucket-arn"
-      SourceAccount: !Ref AWS::AccountId
+          Fn::Sub: "${ProjectName}-conversion-queue-arn"
+      BatchSize: 10  # Process up to 10 messages per batch
+      MaximumBatchingWindowInSeconds: 5  # Wait up to 5 seconds to accumulate messages
+      Enabled: true
+      # Note: MaximumConcurrency and ScalingConfig can be added for fine-tuning
+
+
 
   # ================================
   # S3 Bucket Notifications (connects to existing bucket)
@@ -548,27 +302,33 @@ Resources:
   SourceBucketNotificationConfiguration:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: 
+      BucketName:
         Fn::ImportValue:
           Fn::Sub: "${ProjectName}-source-bucket-name"
       NotificationConfiguration:
-        LambdaConfigurations:
+        QueueConfigurations:
           - Event: s3:ObjectCreated:*
-            Function: !GetAtt DocumentConverterFunction.Arn
+            Queue:
+              Fn::ImportValue:
+                Fn::Sub: "${ProjectName}-conversion-queue-arn"
             Filter:
               S3Key:
                 Rules:
                   - Name: suffix
                     Value: .pdf
           - Event: s3:ObjectCreated:*
-            Function: !GetAtt DocumentConverterFunction.Arn
+            Queue:
+              Fn::ImportValue:
+                Fn::Sub: "${ProjectName}-conversion-queue-arn"
             Filter:
               S3Key:
                 Rules:
                   - Name: suffix
                     Value: .docx
           - Event: s3:ObjectCreated:*
-            Function: !GetAtt DocumentConverterFunction.Arn
+            Queue:
+              Fn::ImportValue:
+                Fn::Sub: "${ProjectName}-conversion-queue-arn"
             Filter:
               S3Key:
                 Rules:
@@ -649,6 +409,47 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref DocumentConverterFunction
+
+  # ================================
+  # SQS Monitoring Alarms
+  # ================================
+  SQSQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-sqs-queue-depth"
+      AlarmDescription: "SQS queue has messages pending processing"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100  # Alert if more than 100 messages pending
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub "${ProjectName}-document-conversion-events"
+      TreatMissingData: notBreaching
+
+  SQSDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-sqs-dlq-messages"
+      AlarmDescription: "Messages in dead letter queue indicate processing failures"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1  # Alert if any messages in DLQ
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub "${ProjectName}-document-conversion-dlq"
+      AlarmActions: !If
+        - HasNotificationTopic
+        - - Fn::ImportValue:
+              Fn::Sub: "${ProjectName}-failure-topic-arn"
+        - !Ref AWS::NoValue
 
   # ================================
   # Lambda Function URL (Optional - for testing)
@@ -740,11 +541,18 @@ Outputs:
   # Monitoring Endpoints
   CloudWatchLogGroup:
     Description: CloudWatch log group for Lambda function
-    Value: 
+    Value:
       Fn::ImportValue:
         Fn::Sub: "${ProjectName}-log-group-name"
     Export:
       Name: !Sub "${ProjectName}-lambda-log-group"
+
+  # SQS Event Source Information
+  SQSEventSourceMappingUUID:
+    Description: UUID of the SQS event source mapping
+    Value: !Ref DocumentConverterSQSEventSourceMapping
+    Export:
+      Name: !Sub "${ProjectName}-sqs-event-source-mapping"
 
   # Cross-Stack References Used
   ReferencedInfrastructureStack:

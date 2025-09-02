@@ -182,9 +182,17 @@ Resources:
                 Effect: Allow
                 Action:
                   - s3:ListBucket
-                Resource: 
+                Resource:
                   - !GetAtt SourceDocumentsBucket.Arn
                   - !GetAtt MarkdownOutputBucket.Arn
+              - Sid: SQSQueueAccess
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt DocumentConversionQueue.Arn
         - !If
           - EnableMonitoring
           - PolicyName: CloudWatchMetrics
@@ -263,6 +271,44 @@ Resources:
       Endpoint: !Ref NotificationEmail
 
   # ================================
+  # SQS Queue for Document Conversion Events
+  # ================================
+  DocumentConversionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-document-conversion-events"
+      MessageRetentionPeriod: 345600  # 4 days
+      VisibilityTimeoutSeconds: 300   # 5 minutes (should match Lambda timeout)
+      DelaySeconds: 0
+      MaximumMessageSize: 262144      # 256KB
+      ReceiveMessageWaitTimeSeconds: 20  # Enable long polling
+      KmsMasterKeyId: alias/aws/sqs
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentConversionDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-conversion-queue"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DocumentConversionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-document-conversion-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-conversion-dlq"
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ================================
   # CloudWatch Dashboard (if monitoring enabled)
   # ================================
   ConversionDashboard:
@@ -331,10 +377,49 @@ Resources:
               }
             },
             {
-              "type": "log",
-              "x": 12,
-              "y": 6,
+              "type": "metric",
+              "x": 0,
+              "y": 12,
               "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ProjectName}-document-conversion-events" ],
+                  [ ".", "ApproximateNumberOfMessagesNotVisible", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SQS Queue Status",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ProjectName}-document-conversion-events" ],
+                  [ ".", "NumberOfMessagesReceived", ".", "." ],
+                  [ ".", "NumberOfMessagesDeleted", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SQS Message Throughput",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 18,
+              "width": 24,
               "height": 6,
               "properties": {
                 "query": "SOURCE '/aws/lambda/${ProjectName}-document-converter'\n| fields @timestamp, @message\n| filter @message like /CONVERSION_METRICS/\n| sort @timestamp desc\n| limit 100",
@@ -400,6 +485,28 @@ Resources:
       Type: String
       Value: !Ref DocumentConverterLogGroup
       Description: !Sub "CloudWatch log group name for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  ConversionQueueParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/conversion-queue-url"
+      Type: String
+      Value: !Ref DocumentConversionQueue
+      Description: !Sub "SQS conversion queue URL for ${ProjectName}"
+      Tags:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+
+  ConversionDLQParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/doc-converter/${ProjectName}/conversion-dlq-url"
+      Type: String
+      Value: !Ref DocumentConversionDeadLetterQueue
+      Description: !Sub "SQS conversion dead letter queue URL for ${ProjectName}"
       Tags:
         ProjectName: !Ref ProjectName
         Environment: !Ref Environment
@@ -506,3 +613,28 @@ Outputs:
     Value: !Ref AWS::AccountId
     Export:
       Name: !Sub "${ProjectName}-account-id"
+
+  # SQS Queue Information
+  DocumentConversionQueueUrl:
+    Description: URL of the document conversion SQS queue
+    Value: !Ref DocumentConversionQueue
+    Export:
+      Name: !Sub "${ProjectName}-conversion-queue-url"
+
+  DocumentConversionQueueArn:
+    Description: ARN of the document conversion SQS queue
+    Value: !GetAtt DocumentConversionQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-conversion-queue-arn"
+
+  DocumentConversionDeadLetterQueueUrl:
+    Description: URL of the document conversion dead letter queue
+    Value: !Ref DocumentConversionDeadLetterQueue
+    Export:
+      Name: !Sub "${ProjectName}-conversion-dlq-url"
+
+  DocumentConversionDeadLetterQueueArn:
+    Description: ARN of the document conversion dead letter queue
+    Value: !GetAtt DocumentConversionDeadLetterQueue.Arn
+    Export:
+      Name: !Sub "${ProjectName}-conversion-dlq-arn"
